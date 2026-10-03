@@ -35,6 +35,7 @@ import { mobileApplicationActiveWakeup } from "./app-state-wakeups";
 import { connectionStorageLayer } from "./storage";
 
 function networkStatus(state: Network.NetworkState): "unknown" | "offline" | "online" {
+  if (AppState.currentState === "background") return "offline";
   if (state.isConnected === false) {
     return "offline";
   }
@@ -62,9 +63,11 @@ const connectivityLayer = Connectivity.layer({
           Queue.offerUnsafe(queue, networkStatus(state));
         });
         const appStateSubscription = AppState.addEventListener("change", (state) => {
-          if (state !== "active") {
+          if (state === "background") {
+            Queue.offerUnsafe(queue, "offline");
             return;
           }
+          if (state !== "active") return;
           void Network.getNetworkStateAsync()
             .then((current) => {
               if (active) {
@@ -87,14 +90,19 @@ const connectivityLayer = Connectivity.layer({
 });
 
 const wakeupsLayer = Wakeups.layer({
+  applicationActive: Effect.sync(() => AppState.currentState !== "background"),
   changes: Stream.merge(
-    Stream.callback<"application-active-probe" | "application-active-reconnect">((queue) =>
+    Stream.callback<
+      "application-background" | "application-active-probe" | "application-active-reconnect"
+    >((queue) =>
       Effect.acquireRelease(
         Effect.sync(() => {
           let backgroundedAtMs = AppState.currentState === "background" ? Date.now() : null;
+          if (backgroundedAtMs !== null) Queue.offerUnsafe(queue, "application-background");
           return AppState.addEventListener("change", (state) => {
             if (state === "background") {
               backgroundedAtMs = Date.now();
+              Queue.offerUnsafe(queue, "application-background");
               return;
             }
             if (state === "active") {

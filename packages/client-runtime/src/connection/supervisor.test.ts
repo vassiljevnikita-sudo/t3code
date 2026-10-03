@@ -122,6 +122,7 @@ const eventuallyState = Effect.fn("TestConnectionHarness.eventuallyState")(funct
 
 const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?: {
   readonly networkStatus?: NetworkStatus;
+  readonly applicationActive?: boolean;
   readonly prepare?: (
     attempt: number,
     target: ConnectionTarget,
@@ -194,6 +195,7 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
     Layer.succeed(
       ConnectionWakeups.ConnectionWakeups,
       ConnectionWakeups.ConnectionWakeups.of({
+        applicationActive: Effect.succeed(options?.applicationActive ?? true),
         changes: SubscriptionRef.changes(wakeups).pipe(
           Stream.drop(1),
           Stream.map((event) => event.reason),
@@ -230,6 +232,127 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
 });
 
 describe("EnvironmentSupervisor", () => {
+  it.effect("interrupts a stalled foreground probe when the app is backgrounded", () =>
+    Effect.gen(function* () {
+      const probing = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        probe: () => Deferred.succeed(probing, undefined).pipe(Effect.andThen(Effect.never)),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      yield* harness.wake("application-active-probe");
+      yield* Deferred.await(probing);
+      yield* harness.wake("application-background");
+      yield* awaitState(supervisor.state, (state) => state.phase === "available");
+      expect(yield* Ref.get(harness.releaseCount)).toBe(1);
+      yield* TestClock.adjust("10 minutes");
+      expect(yield* Ref.get(harness.prepareCount)).toBe(1);
+      yield* harness.wake("application-active-reconnect");
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("parks a mobile connection started in the background until the app opens", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({ applicationActive: false });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+      yield* TestClock.adjust("10 minutes");
+      expect(yield* Ref.get(harness.prepareCount)).toBe(0);
+      yield* harness.wake("application-active-reconnect");
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      expect(yield* Ref.get(harness.sessionCount)).toBe(1);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect(
+    "closes the socket in the background and ignores network changes, credentials and retries",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness();
+        const supervisor = yield* EnvironmentSupervisor.make(RELAY_ENTRY, {
+          initiallyDesired: true,
+        }).pipe(Effect.provide(harness.dependencies));
+        yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+        yield* harness.wake("application-background");
+        yield* awaitState(supervisor.state, (state) => state.phase === "available");
+        expect(yield* Ref.get(harness.releaseCount)).toBe(1);
+        expect(Option.isNone(yield* SubscriptionRef.get(supervisor.session))).toBe(true);
+        yield* harness.setNetworkStatus("offline");
+        yield* harness.setNetworkStatus("online");
+        yield* harness.wake("credentials-changed");
+        yield* supervisor.retryNow;
+        yield* TestClock.adjust("10 minutes");
+        expect(yield* Ref.get(harness.prepareCount)).toBe(1);
+        yield* harness.wake("application-active-reconnect");
+        yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+        expect(yield* Ref.get(harness.sessionCount)).toBe(2);
+      }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("cancels connection setup when the app enters the background", () =>
+    Effect.gen(function* () {
+      const started = yield* Deferred.make<void>();
+      const harness = yield* makeHarness({
+        ready: (attempt) =>
+          attempt === 1
+            ? Deferred.succeed(started, undefined).pipe(Effect.andThen(Effect.never))
+            : Effect.void,
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+      yield* Deferred.await(started);
+      yield* harness.wake("application-background");
+      yield* awaitState(supervisor.state, (state) => state.phase === "available");
+      expect(yield* Ref.get(harness.releaseCount)).toBe(1);
+      yield* TestClock.adjust("10 minutes");
+      expect(yield* Ref.get(harness.prepareCount)).toBe(1);
+      yield* harness.wake("application-active-reconnect");
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("cancels retry backoff in the background and reconnects immediately on return", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness({
+        prepare: (attempt) =>
+          attempt === 1 ? Effect.fail(transient()) : Effect.succeed(PREPARED_CONNECTION),
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+      yield* awaitState(supervisor.state, (state) => state.phase === "backoff");
+      yield* harness.wake("application-background");
+      yield* awaitState(supervisor.state, (state) => state.phase === "available");
+      yield* TestClock.adjust("10 minutes");
+      expect(yield* Ref.get(harness.prepareCount)).toBe(1);
+      yield* harness.wake("application-active-reconnect");
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      expect(yield* Ref.get(harness.prepareCount)).toBe(2);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
+  it.effect("does not reconnect an explicitly disconnected environment on foreground return", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+      yield* awaitState(supervisor.state, (state) => state.phase === "connected");
+      yield* harness.wake("application-background");
+      yield* awaitState(supervisor.state, (state) => state.phase === "available");
+      yield* supervisor.disconnect;
+      yield* harness.wake("application-active-reconnect");
+      yield* TestClock.adjust("10 minutes");
+      expect(yield* Ref.get(harness.prepareCount)).toBe(1);
+    }).pipe(Effect.provide(TestClock.layer())),
+  );
+
   it.effect("exports each relay setup as a standalone linked trace that ends at readiness", () =>
     Effect.gen(function* () {
       const spans: Array<Tracer.NativeSpan> = [];

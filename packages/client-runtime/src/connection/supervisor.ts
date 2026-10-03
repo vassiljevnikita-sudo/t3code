@@ -37,6 +37,7 @@ const BACKOFF_RESET_AFTER_MS = 30_000;
 
 interface SupervisorIntent {
   readonly desired: boolean;
+  readonly applicationActive: boolean;
   readonly network: NetworkStatus;
 }
 
@@ -230,6 +231,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   const wakeups = yield* ConnectionWakeups.ConnectionWakeups;
   const initialIntent: SupervisorIntent = {
     desired: options?.initiallyDesired ?? false,
+    applicationActive: wakeups.applicationActive ? yield* wakeups.applicationActive : true,
     network: yield* connectivity.status,
   };
   const intent = yield* Ref.make(initialIntent);
@@ -240,7 +242,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
   // the first backoff rung instead of sleeping.
   const wakeProbeFailed = yield* Ref.make(false);
   const state = yield* SubscriptionRef.make<SupervisorConnectionState>(
-    !initialIntent.desired
+    !initialIntent.desired || !initialIntent.applicationActive
       ? availableState(initialIntent, 0)
       : initialIntent.network === "offline"
         ? offlineState(initialIntent, 0, 0, null)
@@ -380,6 +382,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         case "ConnectRequested":
           break;
         case "Wakeup":
+          if (next.reason === "application-background") return false;
           if (next.reason === "application-active-reconnect") {
             return true;
           }
@@ -407,6 +410,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
           }
           break;
         case "Wakeup":
+          if (next.reason === "application-background") return false;
           if (next.reason === "credentials-changed" && target._tag === "RelayConnectionTarget") {
             yield* logManagedRelayAccountChange;
             return false;
@@ -462,6 +466,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
                   }
                   break;
                 case "Wakeup":
+                  if (probeEvent.signal.reason === "application-background") {
+                    yield* Fiber.interrupt(probe);
+                    return false;
+                  }
                   if (probeEvent.signal.reason === "application-active-reconnect") {
                     yield* Fiber.interrupt(probe);
                     return true;
@@ -556,7 +564,11 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
 
     const active = establishment.exit.value;
     const currentIntent = yield* Ref.get(intent);
-    if (!currentIntent.desired || currentIntent.network === "offline") {
+    if (
+      !currentIntent.desired ||
+      !currentIntent.applicationActive ||
+      currentIntent.network === "offline"
+    ) {
       return {
         _tag: "Interrupted",
         established: false,
@@ -649,11 +661,14 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
         pendingRetry = Option.none();
       }
       const currentIntent = yield* Ref.get(intent);
-      if (!currentIntent.desired) {
+      if (!currentIntent.desired || !currentIntent.applicationActive) {
         resetRetryLadder();
         latestFailure = null;
         yield* clearLease;
-        yield* setState(availableState(currentIntent, generation));
+        yield* setState({
+          ...availableState(currentIntent, generation),
+          desired: currentIntent.desired,
+        });
         yield* waitForSignal;
         continue;
       }
@@ -760,7 +775,17 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     Effect.forkScoped,
   );
   yield* wakeups.changes.pipe(
-    Stream.runForEach((reason) => signal({ _tag: "Wakeup", reason })),
+    Stream.runForEach((reason) =>
+      Ref.update(intent, (current) => ({
+        ...current,
+        applicationActive:
+          reason === "application-background"
+            ? false
+            : ConnectionWakeups.isApplicationActiveWakeup(reason)
+              ? true
+              : current.applicationActive,
+      })).pipe(Effect.andThen(signal({ _tag: "Wakeup", reason }))),
+    ),
     Effect.forkScoped,
   );
   yield* run().pipe(Effect.forkScoped);

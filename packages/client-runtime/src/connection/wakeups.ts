@@ -1,11 +1,13 @@
 import * as Context from "effect/Context";
 import * as Layer from "effect/Layer";
+import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
 export type ConnectionWakeup =
   | "application-active"
   | "application-active-probe"
   | "application-active-reconnect"
+  | "application-background"
   | "credentials-changed";
 
 export function isApplicationActiveWakeup(reason: ConnectionWakeup): boolean {
@@ -25,6 +27,7 @@ export class ConnectionWakeups extends Context.Service<
   ConnectionWakeups,
   {
     readonly changes: Stream.Stream<ConnectionWakeup>;
+    readonly applicationActive?: Effect.Effect<boolean>;
   }
 >()("@t3tools/client-runtime/connection/wakeups/ConnectionWakeups") {}
 

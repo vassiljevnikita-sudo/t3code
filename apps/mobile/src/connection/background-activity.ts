@@ -11,19 +11,18 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
-import * as Schedule from "effect/Schedule";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AppState } from "react-native";
 
 import * as MobileStorage from "../persistence/mobile-storage";
+import { foregroundActivityReports } from "./foreground-activity-reports";
 import {
   observeMobileBackgroundActivitySubscription,
   onRetainedMobileBackgroundScopesChange,
   retainedMobileBackgroundScopes,
 } from "./background-activity-scopes";
 
-const REPORT_INTERVAL_MS = 25_000;
 const LEASE_TTL_MS = 45_000;
 const BASELINE_SCOPES: ReadonlyArray<BackgroundScope> = [{ type: "provider-status" }];
 
@@ -52,10 +51,13 @@ export const mobileBackgroundActivityReporterLayer = Layer.effectDiscard(
       Effect.orElseSucceed(() => "ephemeral-mobile-client"),
     );
     const reportRequests = yield* Queue.sliding<void>(1);
+    const foreground = yield* Queue.sliding<boolean>(1);
     const requestReport = () => Queue.offerUnsafe(reportRequests, undefined);
     let appState = AppState.currentState;
+    yield* Queue.offer(foreground, appState === "active");
 
     const report = Effect.gen(function* () {
+      if (appState !== "active") return;
       const observedAtMs = yield* Clock.currentTimeMillis;
       const active = appState === "active";
       const entries = yield* SubscriptionRef.get(registry.entries);
@@ -88,10 +90,12 @@ export const mobileBackgroundActivityReporterLayer = Layer.effectDiscard(
 
     yield* Effect.acquireRelease(
       Effect.sync(() => {
+        appState = AppState.currentState;
+        Queue.offerUnsafe(foreground, appState === "active");
         const removeScopeListener = onRetainedMobileBackgroundScopesChange(requestReport);
         const subscription = AppState.addEventListener("change", (nextState) => {
           appState = nextState;
-          requestReport();
+          Queue.offerUnsafe(foreground, nextState === "active");
         });
         return { removeScopeListener, subscription };
       }),
@@ -105,14 +109,12 @@ export const mobileBackgroundActivityReporterLayer = Layer.effectDiscard(
       Stream.runForEach(() => Effect.sync(requestReport)),
       Effect.forkScoped,
     );
-    yield* Stream.fromQueue(reportRequests).pipe(
-      Stream.debounce("250 millis"),
-      Stream.runForEach(() => report),
-      Effect.forkScoped,
-    );
-    yield* Effect.sync(requestReport).pipe(
-      Effect.repeat(Schedule.spaced(`${REPORT_INTERVAL_MS} millis`)),
-      Effect.forkScoped,
-    );
+    // Closing the socket also releases the server's activity lease. In the
+    // background there is no periodic report, timer, or retained RPC demand.
+    yield* foregroundActivityReports(
+      Stream.fromQueue(foreground),
+      Stream.fromQueue(reportRequests),
+      report,
+    ).pipe(Effect.forkScoped);
   }),
 );
